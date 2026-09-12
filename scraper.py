@@ -31,9 +31,17 @@ from openpyxl.utils import column_index_from_string
 
 SITE_URL = "https://topstokee.com"
 ROOT_SITEMAP = f"{SITE_URL}/sitemap.xml"
+SCRAPER_VERSION = "1.4"
 TEMPLATE_SHEET = "Template"
 FIRST_DATA_ROW = 5
 REQUEST_MIN_INTERVAL_SECONDS = 0.22
+
+TEST_PRODUCT_URLS = (
+    f"{SITE_URL}/product/teniski-za-dvoyki-stitch-and-angel",
+    f"{SITE_URL}/product/detska-shapka-ballerina-cappuccina",
+    f"{SITE_URL}/product/suichar-za-momichence-mini-dragon-2",
+    f"{SITE_URL}/product/poliesterenkas-ekip-balgariya",
+)
 
 _HTTP_STATE = threading.local()
 _RATE_LOCK = threading.Lock()
@@ -227,6 +235,12 @@ SIZE_ALIASES = {
     "2XS": "XXS",
     "2XL": "XXL",
     "3XL": "XXXL",
+    "М": "M",
+}
+
+AGE_RANGE_HEIGHT_EQUIVALENTS = {
+    "9-11Y": "140",
+    "12-13Y": "152",
 }
 
 
@@ -783,14 +797,19 @@ def parse_product(url: str, config: Config) -> Product:
 
 
 def normalize_size(raw: str) -> tuple[str, str, str, bool]:
-    raw = normalize_space(raw)
-    compact = raw.upper().replace(" ", "")
+    raw = normalize_space(raw).strip(" .")
+    compact = raw.upper().replace(" ", "").rstrip(".")
     numeric_match = re.fullmatch(r"(\d{2,3})(?:СМ|CM)?", compact)
     if numeric_match:
         number = numeric_match.group(1)
         return "2 - Regular Size", "7 - Numeric", number, True
 
-    age_match = re.fullmatch(r"(\d{1,2})(?:Г|ГОД|Y)", compact)
+    age_range_match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:Г|ГОД|ГОДИНИ|Y)?", compact)
+    if age_range_match:
+        start, end = age_range_match.groups()
+        return "101 - Custom size", "10 - Alpha", f"{start}-{end}Y", True
+
+    age_match = re.fullmatch(r"(\d{1,2})(?:Г|ГОД|ГОДИНИ|Y)", compact)
     if age_match:
         return "2 - Regular Size", "8 - Age", f"{age_match.group(1)}Y", True
 
@@ -810,12 +829,70 @@ def get_variant_value(parameters: dict[str, str], names: Iterable[str]) -> str:
     return ""
 
 
+def canonical_component_size(raw: str) -> str:
+    """Normalize a size used inside a multi-garment custom variation label."""
+    cleaned = normalize_space(raw).strip(" .")
+    if not cleaned:
+        return ""
+    _family, _sub_family, temu_size, _is_kids = normalize_size(cleaned)
+    return temu_size
+
+
+def get_gendered_variant_value(parameters: dict[str, str], gender: str) -> str:
+    """Read male/female size fields without depending on exact capitalization."""
+    gender_needles = {
+        "men": ("мъж", "men", "male"),
+        "women": ("дам", "women", "woman", "female"),
+    }[gender]
+    for key, value in parameters.items():
+        lowered = normalize_space(key).casefold()
+        has_size = "размер" in lowered or "size" in lowered
+        if has_size and any(needle in lowered for needle in gender_needles):
+            return normalize_space(value)
+    return ""
+
+
+def extract_size_from_product_name(name: str) -> str:
+    """Read a fixed size embedded in an outlet/sale product title."""
+    match = re.search(
+        r"(?:размер|size)\s*[:=-]\s*([0-9a-zа-я]+(?:\s*[/-]\s*[0-9a-zа-я]+)?)",
+        name,
+        flags=re.IGNORECASE,
+    )
+    return normalize_space(match.group(1)).strip(" .") if match else ""
+
+
+def extract_variant_size(parameters: dict[str, str], product_name: str) -> str:
+    """Return a standard size, a two-garment size combination, or a title fallback."""
+    direct = get_variant_value(parameters, ("Размер", "Size", "Възраст", "Age"))
+    if direct:
+        return direct
+
+    men = canonical_component_size(get_gendered_variant_value(parameters, "men"))
+    women = canonical_component_size(get_gendered_variant_value(parameters, "women"))
+    if men or women:
+        parts = []
+        if men:
+            parts.append(f"Men {men}")
+        if women:
+            parts.append(f"Women {women}")
+        return " / ".join(parts)
+
+    return extract_size_from_product_name(product_name)
+
+
 def classify_kind(product: Product) -> str | None:
-    text = f"{product.category_path} {product.name} {product.url}".lower()
+    identity_text = f"{product.name} {product.url}".lower()
+    if re.search(r"шапк|shapk|cap\b|hat\b", identity_text):
+        return "hat"
+    if re.search(r"раниц|ranic|backpack", identity_text):
+        return None
+
+    text = f"{product.category_path} {identity_text}".lower()
+    if re.search(r"шапк|shapk|cap\b|hat\b", text) and not re.search(r"раниц|ranic|backpack", text):
+        return "hat"
     if re.search(r"раниц|ranic|backpack", text):
         return None
-    if re.search(r"шапк|shapk|cap\b|hat\b", text):
-        return "hat"
     if re.search(r"къс(?:и|) екип|кас[- ]?екип|short set", text):
         return "short_set"
     if re.search(r"дълг(?:и|) екип|далг[- ]?екип|long set", text):
@@ -879,8 +956,10 @@ def parse_composition(text: str, kind: str, config: Config) -> dict[str, float]:
 
 
 def age_group_for(size: str) -> str:
-    number_match = re.search(r"\d+", size)
-    if number_match and int(number_match.group()) >= 158:
+    numbers = [int(value) for value in re.findall(r"\d+", size)]
+    if numbers and max(numbers) >= 13 and not any(value >= 80 for value in numbers):
+        return "13 years and above"
+    if numbers and max(numbers) >= 158:
         return "13 years and above"
     return "12 and under"
 
@@ -894,7 +973,7 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
     composition = parse_composition(f"{product.name}\n{product.description}", kind, config)
     for variant in product.variants:
         params = variant.get("parameters") or {}
-        raw_size = get_variant_value(params, ("Размер", "Size", "Възраст", "Age"))
+        raw_size = extract_variant_size(params, product.name)
         family, sub_family, temu_size, size_implies_kids = normalize_size(raw_size)
         path_implies_kids = "ЗА ДЕЦА" in product.category_path.upper() or "ДЕТСК" in product.name.upper()
         is_kids = size_implies_kids or path_implies_kids
@@ -1048,17 +1127,21 @@ class TemuTemplate:
     @staticmethod
     def measurement_value(title: str, item: OutputRow) -> float:
         size = item.temu_size
-        adult_size = SIZE_ALIASES.get(size.upper(), size.upper())
+        measurement_size = AGE_RANGE_HEIGHT_EQUIVALENTS.get(size, size)
+        paired_men_size = re.search(r"\bMen\s+([0-9A-ZА-Я]+)", size, flags=re.IGNORECASE)
+        if paired_men_size:
+            measurement_size = canonical_component_size(paired_men_size.group(1))
+        adult_size = SIZE_ALIASES.get(measurement_size.upper(), measurement_size.upper())
         if item.is_kids:
             top_table = (
                 TOP_MEASUREMENTS_HOODIE_KIDS
                 if item.product_kind in {"hoodie", "sweatshirt"}
                 else TOP_MEASUREMENTS_TSHIRT_KIDS
             )
-            chest, top_length = top_table.get(size, (43.0, 55.0))
-            numeric = int(re.search(r"\d+", size).group()) if re.search(r"\d+", size) else 128
+            chest, top_length = top_table.get(measurement_size, (43.0, 55.0))
+            numeric = int(re.search(r"\d+", measurement_size).group()) if re.search(r"\d+", measurement_size) else 128
             if item.product_kind in {"short_set", "long_set", "set"}:
-                waist, pants_length = BOTTOM_MEASUREMENTS_SET_KIDS.get(size, (26.0, 32.0))
+                waist, pants_length = BOTTOM_MEASUREMENTS_SET_KIDS.get(measurement_size, (26.0, 32.0))
             else:
                 waist = 23.0 + max(0, numeric - 104) * 0.125
                 pants_length = 28.0 + max(0, numeric - 104) * 0.18
@@ -1206,6 +1289,7 @@ def main() -> int:
     if args.workers > 0:
         config.workers = max(1, min(args.workers, 3))
     configure_logging(args.output_dir)
+    logging.info("TopStokee Temu scraper version %s", SCRAPER_VERSION)
     try:
         configure_proxy(config)
     except RuntimeError as exc:
@@ -1222,7 +1306,12 @@ def main() -> int:
         return 2
 
     limit = args.max_products or (15 if args.mode == "test" else 0)
-    urls = list(dict.fromkeys(args.start_url)) if args.start_url else discover_product_urls(config, limit)
+    if args.start_url:
+        urls = list(dict.fromkeys(args.start_url))
+    else:
+        discovered = discover_product_urls(config, limit)
+        priority = TEST_PRODUCT_URLS if args.mode == "test" else ()
+        urls = list(dict.fromkeys((*priority, *discovered)))
     if limit:
         urls = urls[:limit]
     logging.info("Products selected: %d", len(urls))
@@ -1257,6 +1346,7 @@ def main() -> int:
     created = write_workbooks(output_rows, args.template, args.output_dir, config) if output_rows else []
 
     summary = {
+        "scraper_version": SCRAPER_VERSION,
         "products_requested": len(urls),
         "products_parsed": len(products),
         "temu_rows": len(output_rows),

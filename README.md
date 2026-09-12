@@ -1,6 +1,6 @@
 # TopStokee → Temu scraper
 
-Version 1.3 routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
+Version 1.4 routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
 
 The scraper scans all products on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template. Product discovery automatically falls back from the sitemap index to direct product sitemaps and then to the complete product catalogue when a GitHub runner receives HTTP 403.
 
@@ -8,6 +8,9 @@ The scraper scans all products on `topstokee.com`, reads the CloudCart product d
 
 - scans the whole site in `full` mode;
 - exports each sellable variation on a separate row;
+- combines the separate men's and women's sizes for couple products into labels such as `Men S / Women M`;
+- normalizes Cyrillic `М`, children's age ranges, and fixed outlet sizes found in product names;
+- distinguishes children's hats from backpacks in the combined site category;
 - splits mixed adult and children's sizes into separate Temu parent products;
 - uses the live discounted price and keeps the old price as the list price when available;
 - collects up to 10 SKU images and available detail/size-guide images;
@@ -37,11 +40,11 @@ The Worker URL is already set in `config.json` as `https://topstokee-proxy.hkole
 
 1. Upload every file and folder from this package to the GitHub repository. Keep `.github/workflows/scraper.yml` in the same path.
 2. Open **Actions → TopStokee Temu scraper → Run workflow**.
-3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products.
+3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products and prioritizes the corrected couple-size, children's-hat, age-range, and Cyrillic-size cases.
 4. Download the `topstokee-temu-results` artifact and test one generated XLSX in Temu.
 5. After the test succeeds, run again with `mode = full` and `max_products = 0`.
 
-A full run currently discovers about 2,300 product pages and can take roughly 45–90 minutes, depending on the site's response time. GitHub Actions keeps the generated files as a downloadable artifact.
+A full run currently discovers about 2,300 product pages and normally takes roughly 20–40 minutes through the Worker, depending on the site's response time. GitHub Actions keeps the generated files as a downloadable artifact.
 
 ## Assumptions to review in `config.json`
 
@@ -58,6 +61,7 @@ Products for which the supplied Temu template has no suitable category, such as 
 
 ```bash
 python -m pip install -r requirements.txt
+python -m unittest -v test_scraper.py
 python scraper.py --mode test
 python scraper.py --mode full --max-products 0
 ```
