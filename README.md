@@ -1,6 +1,6 @@
 # TopStokee → Temu scraper
 
-Version 1.4 routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
+Version 1.5 routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
 
 The scraper scans all products on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template. Product discovery automatically falls back from the sitemap index to direct product sitemaps and then to the complete product catalogue when a GitHub runner receives HTTP 403.
 
@@ -9,13 +9,16 @@ The scraper scans all products on `topstokee.com`, reads the CloudCart product d
 - scans the whole site in `full` mode;
 - exports each sellable variation on a separate row;
 - combines the separate men's and women's sizes for couple products into labels such as `Men S / Women M`;
+- recognizes flexible parameter labels such as sizes for him/her, alternative color labels, gender and model selectors;
+- separates gender/model groups into distinct Temu parent products when the source site reuses the same sizes;
 - normalizes Cyrillic `М`, children's age ranges, and fixed outlet sizes found in product names;
 - distinguishes children's hats from backpacks in the combined site category;
 - splits mixed adult and children's sizes into separate Temu parent products;
 - uses the live discounted price and keeps the old price as the list price when available;
 - collects up to 10 SKU images and available detail/size-guide images;
 - removes the promotional delivery/payment/exchange text from descriptions;
-- splits output automatically into files of at most 1,900 data rows;
+- splits output automatically into files of at most 1,900 data rows while keeping every parent product wholly inside one file;
+- validates unique SKU values and unique `parent SKU + color + size` combinations before creating any Excel file;
 - produces a raw CSV, a skipped-products CSV, a log, and a summary.
 
 ## GitHub Actions
@@ -40,8 +43,8 @@ The Worker URL is already set in `config.json` as `https://topstokee-proxy.hkole
 
 1. Upload every file and folder from this package to the GitHub repository. Keep `.github/workflows/scraper.yml` in the same path.
 2. Open **Actions → TopStokee Temu scraper → Run workflow**.
-3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products and prioritizes the corrected couple-size, children's-hat, age-range, and Cyrillic-size cases.
-4. Download the `topstokee-temu-results` artifact and test one generated XLSX in Temu.
+3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products and prioritizes several couple-size formats, repeated adult sizes, the children's hat, age ranges, and Cyrillic sizes.
+4. Download the `topstokee-temu-results` artifact and confirm that `summary.json` contains `"validation_passed": true`, `"duplicate_variant_combinations": 0`, and `"parent_products_split_across_files": 0`.
 5. After the test succeeds, run again with `mode = full` and `max_products = 0`.
 
 A full run currently discovers about 2,300 product pages and normally takes roughly 20–40 minutes through the Worker, depending on the site's response time. GitHub Actions keeps the generated files as a downloadable artifact.
@@ -56,6 +59,8 @@ A full run currently discovers about 2,300 product pages and normally takes roug
 - package weight/dimensions and fallback fabric composition use product-type defaults in `scraper.py`.
 
 Products for which the supplied Temu template has no suitable category, such as standalone sweatpants or backpacks, are not forced into an incorrect category. They are listed in `topstokee_skipped_products.csv`.
+
+If the source site introduces a variation pattern that cannot be represented uniquely in Temu, validation stops the run before any XLSX file is created. The raw CSV retains `variant_group` and `variant_parameters` columns for diagnosis.
 
 ## Local run
 

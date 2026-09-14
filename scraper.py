@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import html
 import json
 import logging
@@ -31,13 +32,15 @@ from openpyxl.utils import column_index_from_string
 
 SITE_URL = "https://topstokee.com"
 ROOT_SITEMAP = f"{SITE_URL}/sitemap.xml"
-SCRAPER_VERSION = "1.4"
+SCRAPER_VERSION = "1.5"
 TEMPLATE_SHEET = "Template"
 FIRST_DATA_ROW = 5
 REQUEST_MIN_INTERVAL_SECONDS = 0.22
 
 TEST_PRODUCT_URLS = (
     f"{SITE_URL}/product/teniski-za-dvoyki-stitch-and-angel",
+    f"{SITE_URL}/product/suichari-za-dvoyki-angel-and-stitch",
+    f"{SITE_URL}/product/teniska-balgariya-8",
     f"{SITE_URL}/product/detska-shapka-ballerina-cappuccina",
     f"{SITE_URL}/product/suichar-za-momichence-mini-dragon-2",
     f"{SITE_URL}/product/poliesterenkas-ekip-balgariya",
@@ -329,6 +332,8 @@ class OutputRow:
     product_kind: str
     is_kids: bool
     age_group: str
+    variant_group: str = ""
+    variant_parameters: dict[str, str] = field(default_factory=dict)
 
 
 def browser_session() -> Any:
@@ -838,16 +843,183 @@ def canonical_component_size(raw: str) -> str:
     return temu_size
 
 
+SIZE_KEY_MARKERS = ("размер", "size", "възраст", "age")
+COLOR_KEY_MARKERS = ("цвят", "цвет", "color", "colour")
+COUPLE_MARKERS = ("двойк", "couple", "pair")
+MEN_KEY_MARKERS = ("мъж", "men", "male", "него", "момче", "boy")
+WOMEN_KEY_MARKERS = ("дам", "жен", "women", "woman", "female", "нея", "момич", "girl")
+
+
+def normalized_parameter_key(value: str) -> str:
+    return normalize_space(strip_accents(value).casefold())
+
+
+def parameter_gender(key: str) -> str:
+    lowered = normalized_parameter_key(key)
+    # Check the women's markers first because the English word "women" contains "men".
+    if any(marker in lowered for marker in WOMEN_KEY_MARKERS):
+        return "women"
+    if any(marker in lowered for marker in MEN_KEY_MARKERS):
+        return "men"
+    return ""
+
+
+def looks_like_size_value(value: str) -> bool:
+    compact = normalize_space(value).upper().replace(" ", "").strip(" .")
+    if not compact:
+        return False
+    return bool(
+        re.fullmatch(r"(?:[2-9]?X?[SML]|[2-9]XL|XXS|XS|XXL|XXXL|ONE(?:SIZE)?|ONESIZE)", compact)
+        or re.fullmatch(r"\d{2,3}(?:СМ|CM)?", compact)
+        or re.fullmatch(r"\d{1,2}[/-]\d{1,2}(?:Г|ГОД|ГОДИНИ|Y)?", compact)
+        or re.fullmatch(r"\d{1,2}(?:Г|ГОД|ГОДИНИ|Y)", compact)
+        or compact in {"М", "УНИВЕРСАЛЕН", "ЕДИНРАЗМЕР"}
+    )
+
+
+def parameter_role(key: str, value: str) -> str:
+    lowered = normalized_parameter_key(key)
+    if any(marker in lowered for marker in COLOR_KEY_MARKERS):
+        return "color"
+    if any(marker in lowered for marker in SIZE_KEY_MARKERS) or looks_like_size_value(value):
+        return "size"
+    return "other"
+
+
+def clean_parameter_label(key: str, fallback: str) -> str:
+    label = normalize_space(key)
+    label = re.sub(
+        r"\b(?:избери|изберете|select|размер|size|възраст|age|цвят|цветове?|colou?r)\b",
+        " ",
+        label,
+        flags=re.IGNORECASE,
+    )
+    label = normalize_space(label).strip(" :-/")
+    return label or fallback
+
+
+def is_couple_product(name: str, category_path: str = "") -> bool:
+    lowered = normalized_parameter_key(f"{name} {category_path}")
+    return any(marker in lowered for marker in COUPLE_MARKERS)
+
+
+def build_parameter_profile(variants: list[dict[str, Any]]) -> dict[str, Any]:
+    labels: dict[str, str] = {}
+    values: dict[str, set[str]] = {}
+    roles: dict[str, str] = {}
+    for variant in variants:
+        for key, value in (variant.get("parameters") or {}).items():
+            canonical = normalized_parameter_key(key)
+            labels.setdefault(canonical, normalize_space(key))
+            values.setdefault(canonical, set()).add(normalize_space(value))
+            detected = parameter_role(key, value)
+            previous = roles.get(canonical)
+            if previous != "color":
+                roles[canonical] = detected if previous in (None, "other") else previous
+    size_keys = {key for key, role in roles.items() if role == "size"}
+    color_keys = {key for key, role in roles.items() if role == "color"}
+    varying_other_keys = {
+        key for key, role in roles.items()
+        if role == "other" and len({value for value in values.get(key, set()) if value}) > 1
+    }
+    return {
+        "labels": labels,
+        "values": values,
+        "roles": roles,
+        "size_keys": size_keys,
+        "color_keys": color_keys,
+        "varying_other_keys": varying_other_keys,
+    }
+
+
+def format_multi_size(entries: list[tuple[str, str]], *, couple: bool) -> str:
+    labelled: list[tuple[str, str]] = []
+    used_labels: set[str] = set()
+    for index, (key, value) in enumerate(entries, start=1):
+        gender = parameter_gender(key)
+        if gender == "men":
+            label = "Men"
+        elif gender == "women":
+            label = "Women"
+        else:
+            fallback = f"Person {index}" if couple else f"Item {index}"
+            label = clean_parameter_label(key, fallback)
+            if normalized_parameter_key(label) in {"", "1", "2", "3"}:
+                label = fallback
+        normalized_label = normalized_parameter_key(label)
+        if normalized_label in used_labels:
+            label = f"{label} {index}"
+            normalized_label = normalized_parameter_key(label)
+        used_labels.add(normalized_label)
+        labelled.append((label, canonical_component_size(value)))
+    return " / ".join(f"{label} {size}" for label, size in labelled if size)
+
+
+def analyze_variant_dimensions(
+    parameters: dict[str, str],
+    product_name: str,
+    category_path: str,
+    profile: dict[str, Any],
+    default_color: str,
+) -> tuple[str, str, tuple[tuple[str, str], ...], str]:
+    entries = [
+        (normalized_parameter_key(key), normalize_space(key), normalize_space(value))
+        for key, value in parameters.items()
+        if normalize_space(value)
+    ]
+    size_entries = [(label, value) for key, label, value in entries if key in profile["size_keys"]]
+    color_entries = [(label, value) for key, label, value in entries if key in profile["color_keys"]]
+    couple = is_couple_product(product_name, category_path)
+
+    group_signature: list[tuple[str, str]] = []
+    group_labels: list[str] = []
+
+    if len(size_entries) >= 2:
+        raw_size = format_multi_size(size_entries, couple=couple)
+    elif size_entries:
+        size_key, raw_size = size_entries[0]
+        canonical_key = normalized_parameter_key(size_key)
+        # A product can expose men's, women's or garment-specific sizes under
+        # different parameter names. Keep those sets in separate Temu parents.
+        if len(profile["size_keys"]) > 1:
+            label = clean_parameter_label(size_key, "Model")
+            group_signature.append(("size-parameter", canonical_key))
+            group_labels.append(label)
+    else:
+        raw_size = extract_size_from_product_name(product_name)
+
+    if len(color_entries) >= 2:
+        color = " / ".join(
+            f"{clean_parameter_label(key, f'Color {index}')} {value}"
+            for index, (key, value) in enumerate(color_entries, start=1)
+        )
+    elif color_entries:
+        color_key, color = color_entries[0]
+        canonical_key = normalized_parameter_key(color_key)
+        if len(profile["color_keys"]) > 1:
+            label = clean_parameter_label(color_key, "Color")
+            group_signature.append(("color-parameter", canonical_key))
+            group_labels.append(label)
+    else:
+        color = default_color
+
+    for canonical, label, value in entries:
+        if canonical not in profile["varying_other_keys"]:
+            continue
+        group_signature.append((canonical, value))
+        group_labels.append(value or clean_parameter_label(label, "Model"))
+
+    signature = tuple(sorted(dict.fromkeys(group_signature)))
+    group_label = " / ".join(dict.fromkeys(value for value in group_labels if value))
+    return raw_size, color, signature, group_label
+
+
 def get_gendered_variant_value(parameters: dict[str, str], gender: str) -> str:
     """Read male/female size fields without depending on exact capitalization."""
-    gender_needles = {
-        "men": ("мъж", "men", "male"),
-        "women": ("дам", "women", "woman", "female"),
-    }[gender]
     for key, value in parameters.items():
         lowered = normalize_space(key).casefold()
         has_size = "размер" in lowered or "size" in lowered
-        if has_size and any(needle in lowered for needle in gender_needles):
+        if has_size and parameter_gender(key) == gender:
             return normalize_space(value)
     return ""
 
@@ -864,21 +1036,15 @@ def extract_size_from_product_name(name: str) -> str:
 
 def extract_variant_size(parameters: dict[str, str], product_name: str) -> str:
     """Return a standard size, a two-garment size combination, or a title fallback."""
-    direct = get_variant_value(parameters, ("Размер", "Size", "Възраст", "Age"))
-    if direct:
-        return direct
-
-    men = canonical_component_size(get_gendered_variant_value(parameters, "men"))
-    women = canonical_component_size(get_gendered_variant_value(parameters, "women"))
-    if men or women:
-        parts = []
-        if men:
-            parts.append(f"Men {men}")
-        if women:
-            parts.append(f"Women {women}")
-        return " / ".join(parts)
-
-    return extract_size_from_product_name(product_name)
+    profile = build_parameter_profile([{"parameters": parameters}])
+    size, _color, _signature, _label = analyze_variant_dimensions(
+        parameters,
+        product_name,
+        "",
+        profile,
+        "Multicolor",
+    )
+    return size
 
 
 def classify_kind(product: Product) -> str | None:
@@ -969,25 +1135,70 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
     if not kind:
         return [], "No matching product category is available in the supplied Temu template"
 
-    rows: list[OutputRow] = []
     composition = parse_composition(f"{product.name}\n{product.description}", kind, config)
+    profile = build_parameter_profile(product.variants)
+    analyzed_variants: list[dict[str, Any]] = []
     for variant in product.variants:
         params = variant.get("parameters") or {}
-        raw_size = extract_variant_size(params, product.name)
+        raw_size, color, group_signature, group_label = analyze_variant_dimensions(
+            params,
+            product.name,
+            product.category_path,
+            profile,
+            config.default_color,
+        )
         family, sub_family, temu_size, size_implies_kids = normalize_size(raw_size)
         path_implies_kids = "ЗА ДЕЦА" in product.category_path.upper() or "ДЕТСК" in product.name.upper()
-        is_kids = size_implies_kids or path_implies_kids
+        parameter_text = normalized_parameter_key(" ".join(f"{key} {value}" for key, value in params.items()))
+        parameter_implies_kids = any(
+            marker in parameter_text
+            for marker in ("детск", "момче", "момич", "child", "kid", "boy", "girl")
+        )
+        analyzed_variants.append(
+            {
+                "variant": variant,
+                "params": params,
+                "raw_size": raw_size,
+                "family": family,
+                "sub_family": sub_family,
+                "temu_size": temu_size,
+                "is_kids": size_implies_kids or path_implies_kids or parameter_implies_kids,
+                "color": color,
+                "group_signature": group_signature,
+                "group_label": group_label,
+            }
+        )
+
+    mixed_age_groups = len({item["is_kids"] for item in analyzed_variants}) > 1
+    rows: list[OutputRow] = []
+    for analyzed in analyzed_variants:
+        variant = analyzed["variant"]
+        params = analyzed["params"]
+        raw_size = analyzed["raw_size"]
+        family = analyzed["family"]
+        sub_family = analyzed["sub_family"]
+        temu_size = analyzed["temu_size"]
+        is_kids = analyzed["is_kids"]
+        color = analyzed["color"]
+        group_signature = analyzed["group_signature"]
+        group_label = analyzed["group_label"]
         category = category_for(kind, is_kids)
         if not category:
             continue
         category_id, category_key = category
         variant_id = str(variant.get("id") or "single")
         parent_sku = f"TS-{product.product_id}-{category_id}"
+        if group_signature:
+            digest = hashlib.sha1(
+                json.dumps(group_signature, ensure_ascii=False).encode("utf-8")
+            ).hexdigest()[:8].upper()
+            parent_sku += f"-G{digest}"
         sku = f"{parent_sku}-{variant_id}"
         display_name = product.name
-        if any(normalize_size(get_variant_value(v.get("parameters") or {}, ("Размер", "Size")))[3] != is_kids for v in product.variants):
+        if mixed_age_groups:
             display_name += " - за деца" if is_kids else " - за възрастни"
-        color = get_variant_value(params, ("Цвят", "Color")) or config.default_color
+        if group_label and normalized_parameter_key(group_label) not in normalized_parameter_key(display_name):
+            display_name += f" - {group_label}"
         price = float(variant.get("price") or product.price)
         regular = variant.get("list_price") or product.list_price
         list_price = float(regular) if regular and float(regular) > price else None
@@ -1017,6 +1228,8 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
                 product_kind=kind,
                 is_kids=is_kids,
                 age_group=age_group_for(temu_size),
+                variant_group=group_label,
+                variant_parameters=dict(params),
             )
         )
     return rows, None if rows else "No sellable variant could be mapped"
@@ -1196,16 +1409,108 @@ class TemuTemplate:
         return 1.0
 
 
-def chunks(values: list[OutputRow], size: int) -> Iterable[list[OutputRow]]:
-    for start in range(0, len(values), size):
-        yield values[start : start + size]
+def grouped_chunks(values: list[OutputRow], size: int) -> Iterable[list[OutputRow]]:
+    """Split output without ever separating the SKU rows of one Temu parent."""
+    if size < 1:
+        raise ValueError("max_rows_per_file must be at least 1")
+
+    current_batch: list[OutputRow] = []
+    current_group: list[OutputRow] = []
+    current_parent = ""
+
+    def append_group(group: list[OutputRow]) -> Iterable[list[OutputRow]]:
+        nonlocal current_batch
+        if not group:
+            return []
+        if len(group) > size:
+            raise ValueError(
+                f"Temu parent {group[0].parent_sku} has {len(group)} rows, exceeding the file limit {size}"
+            )
+        flushed: list[list[OutputRow]] = []
+        if current_batch and len(current_batch) + len(group) > size:
+            flushed.append(current_batch)
+            current_batch = []
+        current_batch.extend(group)
+        return flushed
+
+    for item in values:
+        if current_parent and item.parent_sku != current_parent:
+            yield from append_group(current_group)
+            current_group = []
+        current_parent = item.parent_sku
+        current_group.append(item)
+
+    yield from append_group(current_group)
+    if current_batch:
+        yield current_batch
+
+
+def validate_output_rows(rows: list[OutputRow], max_rows_per_file: int) -> dict[str, int | bool]:
+    """Fail closed when an export could create ambiguous Temu variations."""
+    sku_seen: dict[str, OutputRow] = {}
+    combination_seen: dict[tuple[str, str, str], OutputRow] = {}
+    parent_counts: dict[str, int] = {}
+    errors: list[str] = []
+
+    for item in rows:
+        if item.sku in sku_seen:
+            errors.append(f"duplicate SKU {item.sku} ({item.source_url})")
+        else:
+            sku_seen[item.sku] = item
+
+        size_component = "" if item.product_kind == "hat" else item.temu_size
+        key = (item.parent_sku, normalize_space(item.color).casefold(), normalize_space(size_component).casefold())
+        previous = combination_seen.get(key)
+        if previous:
+            errors.append(
+                "duplicate variation combination "
+                f"{item.parent_sku} / {item.color} / {size_component or '[no size]'} "
+                f"({previous.sku}, {item.sku})"
+            )
+        else:
+            combination_seen[key] = item
+
+        parent_counts[item.parent_sku] = parent_counts.get(item.parent_sku, 0) + 1
+        if item.price <= 0:
+            errors.append(f"non-positive price for {item.sku}")
+        if not item.main_images:
+            errors.append(f"missing main image for {item.sku}")
+        if not normalize_space(item.description):
+            errors.append(f"missing description for {item.sku}")
+
+    oversized = [(parent, count) for parent, count in parent_counts.items() if count > max_rows_per_file]
+    for parent, count in oversized:
+        errors.append(f"Temu parent {parent} has {count} rows, exceeding {max_rows_per_file}")
+
+    if errors:
+        preview = "; ".join(errors[:12])
+        suffix = f"; plus {len(errors) - 12} more" if len(errors) > 12 else ""
+        raise ValueError(f"Export validation failed: {preview}{suffix}")
+
+    batches = list(grouped_chunks(rows, max_rows_per_file))
+    parent_parts: dict[str, set[int]] = {}
+    for part_number, batch in enumerate(batches, start=1):
+        for item in batch:
+            parent_parts.setdefault(item.parent_sku, set()).add(part_number)
+    split_parents = sum(1 for parts in parent_parts.values() if len(parts) > 1)
+    if split_parents:
+        raise ValueError(f"Export validation failed: {split_parents} parent products span multiple files")
+
+    return {
+        "validation_passed": True,
+        "duplicate_skus": 0,
+        "duplicate_variant_combinations": 0,
+        "parent_products_split_across_files": 0,
+        "parent_products": len(parent_counts),
+    }
 
 
 def write_raw_export(rows: list[OutputRow], path: Path) -> None:
     fields = [
         "source_url", "source_category", "category_id", "category_key", "product_id",
         "parent_sku", "sku", "name", "size_raw", "temu_size", "color", "price",
-        "list_price", "quantity", "composition", "main_images", "detail_images", "description",
+        "variant_group", "variant_parameters", "list_price", "quantity", "composition",
+        "main_images", "detail_images", "description",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -1225,6 +1530,8 @@ def write_raw_export(rows: list[OutputRow], path: Path) -> None:
                     "temu_size": item.temu_size,
                     "color": item.color,
                     "price": item.price,
+                    "variant_group": item.variant_group,
+                    "variant_parameters": json.dumps(item.variant_parameters, ensure_ascii=False, sort_keys=True),
                     "list_price": item.list_price or "",
                     "quantity": item.quantity,
                     "composition": json.dumps(item.composition, ensure_ascii=False),
@@ -1244,7 +1551,7 @@ def write_skipped(rows: list[dict[str, str]], path: Path) -> None:
 
 def write_workbooks(rows: list[OutputRow], template_path: Path, output_dir: Path, config: Config) -> list[Path]:
     created: list[Path] = []
-    for part_number, batch in enumerate(chunks(rows, config.max_rows_per_file), start=1):
+    for part_number, batch in enumerate(grouped_chunks(rows, config.max_rows_per_file), start=1):
         destination = output_dir / f"TEMU_TOPSTOKEE_UPLOAD_part_{part_number:03d}.xlsx"
         shutil.copy2(template_path, destination)
         workbook = load_workbook(destination, read_only=False, data_only=False)
@@ -1343,6 +1650,28 @@ def main() -> int:
     output_rows.sort(key=lambda item: (item.parent_sku, item.sku))
     write_raw_export(output_rows, args.output_dir / "topstokee_raw_export.csv")
     write_skipped(skipped, args.output_dir / "topstokee_skipped_products.csv")
+    try:
+        validation = validate_output_rows(output_rows, config.max_rows_per_file)
+    except ValueError as exc:
+        summary = {
+            "scraper_version": SCRAPER_VERSION,
+            "products_requested": len(urls),
+            "products_parsed": len(products),
+            "temu_rows": len(output_rows),
+            "skipped_products": len(skipped),
+            "xlsx_parts": 0,
+            "validation_passed": False,
+            "validation_error": str(exc),
+            "elapsed_seconds": round(time.time() - started, 1),
+        }
+        (args.output_dir / "summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logging.error("%s", exc)
+        logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))
+        return 3
+
     created = write_workbooks(output_rows, args.template, args.output_dir, config) if output_rows else []
 
     summary = {
@@ -1353,6 +1682,7 @@ def main() -> int:
         "skipped_products": len(skipped),
         "xlsx_parts": len(created),
         "elapsed_seconds": round(time.time() - started, 1),
+        **validation,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Summary: %s", json.dumps(summary, ensure_ascii=False))

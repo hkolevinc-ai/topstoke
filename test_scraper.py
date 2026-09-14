@@ -9,8 +9,10 @@ from scraper import (
     classify_kind,
     extract_size_from_product_name,
     extract_variant_size,
+    grouped_chunks,
     normalize_size,
     product_to_rows,
+    validate_output_rows,
 )
 
 
@@ -56,6 +58,64 @@ class SizeTests(unittest.TestCase):
         self.assertEqual(rows[0].temu_size, "Men S / Women XXL")
         self.assertEqual(rows[0].size_family, "101 - Custom size")
 
+    def test_his_and_hers_size_labels_are_recognized(self):
+        params = {"Размер за него": "S", "Размер за нея": "M"}
+        self.assertEqual(extract_variant_size(params, "Суичъри за двойки"), "Men S / Women M")
+
+    def test_unusual_couple_size_keys_still_create_one_unique_size(self):
+        params = {"Първа дреха": "S", "Втора дреха": "2XL"}
+        self.assertEqual(
+            extract_variant_size(params, "Блузи за двойки"),
+            "Първа дреха S / Втора дреха XXL",
+        )
+
+    def test_different_adult_size_parameters_create_separate_parents(self):
+        rows, reason = product_to_rows(
+            product(
+                "Тениска България",
+                "ТЕНИСКИ",
+                "https://topstokee.com/product/teniska-balgariya",
+                [
+                    {"id": "1", "parameters": {"Мъжки размер": "S"}, "price": 20.0, "list_price": 25.0},
+                    {"id": "2", "parameters": {"Дамски размер": "S"}, "price": 20.0, "list_price": 25.0},
+                ],
+            ),
+            Config(),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row.parent_sku for row in rows}), 2)
+        self.assertTrue(any("Мъжки" in row.name for row in rows))
+        self.assertTrue(any("Дамски" in row.name for row in rows))
+
+    def test_model_parameter_creates_separate_parents(self):
+        rows, _ = product_to_rows(
+            product(
+                "Тениска Металика",
+                "ТЕНИСКИ",
+                "https://topstokee.com/product/teniska-metalika",
+                [
+                    {"id": "1", "parameters": {"Размер": "M", "Модел": "Мъжка"}, "price": 20.0, "list_price": 25.0},
+                    {"id": "2", "parameters": {"Размер": "M", "Модел": "Дамска"}, "price": 20.0, "list_price": 25.0},
+                ],
+            ),
+            Config(),
+        )
+        self.assertEqual(len({row.parent_sku for row in rows}), 2)
+        self.assertEqual({row.variant_group for row in rows}, {"Мъжка", "Дамска"})
+
+    def test_flexible_color_label_is_recognized(self):
+        rows, _ = product_to_rows(
+            product(
+                "Тениска",
+                "ТЕНИСКИ",
+                "https://topstokee.com/product/teniska",
+                [{"id": "1", "parameters": {"Размер": "M", "Избери цвят": "Черен"}, "price": 20.0, "list_price": 25.0}],
+            ),
+            Config(),
+        )
+        self.assertEqual(rows[0].color, "Черен")
+
     def test_fixed_outlet_size_is_read_from_title(self):
         name = "[ РАЗПРОДАЖБА ] Тениска Мафия 14 [ размер: 3XL ]"
         self.assertEqual(extract_size_from_product_name(name), "3XL")
@@ -96,6 +156,61 @@ class CategoryTests(unittest.TestCase):
             "https://topstokee.com/product/detska-ranitsa-stitch",
         )
         self.assertIsNone(classify_kind(item))
+
+
+class ExportSafetyTests(unittest.TestCase):
+    @staticmethod
+    def row(parent: str, sku: str, size: str = "M", color: str = "Black") -> OutputRow:
+        return OutputRow(
+            source_url="https://topstokee.com/product/test",
+            source_category="ТЕНИСКИ",
+            category_id="30469",
+            category_key="tshirt_adult",
+            product_id="1",
+            parent_sku=parent,
+            sku=sku,
+            name="Test",
+            description="Description",
+            bullets=[],
+            main_images=["https://topstokee.com/image.jpg"],
+            detail_images=[],
+            size_raw=size,
+            size_family="2 - Regular Size",
+            sub_size_family="10 - Alpha",
+            temu_size=size,
+            color=color,
+            price=10.0,
+            list_price=12.0,
+            quantity=10,
+            composition={"Cotton": 100.0},
+            product_kind="tshirt",
+            is_kids=False,
+            age_group="13 years and above",
+        )
+
+    def test_duplicate_color_size_combination_is_rejected(self):
+        rows = [self.row("P1", "S1"), self.row("P1", "S2")]
+        with self.assertRaisesRegex(ValueError, "duplicate variation combination"):
+            validate_output_rows(rows, 1900)
+
+    def test_chunks_keep_parent_products_together(self):
+        rows = [
+            self.row("P1", "S1", "S"),
+            self.row("P1", "S2", "M"),
+            self.row("P1", "S3", "L"),
+            self.row("P2", "S4", "S"),
+            self.row("P2", "S5", "M"),
+            self.row("P2", "S6", "L"),
+            self.row("P3", "S7", "S"),
+            self.row("P3", "S8", "M"),
+        ]
+        batches = list(grouped_chunks(rows, 5))
+        self.assertEqual([len(batch) for batch in batches], [3, 5])
+        locations = {}
+        for part, batch in enumerate(batches):
+            for row in batch:
+                locations.setdefault(row.parent_sku, set()).add(part)
+        self.assertTrue(all(len(parts) == 1 for parts in locations.values()))
 
 
 if __name__ == "__main__":
