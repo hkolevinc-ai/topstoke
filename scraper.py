@@ -25,14 +25,17 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-from curl_cffi import requests as browser_requests
+try:
+    from curl_cffi import requests as browser_requests
+except ImportError:  # Lets unit tests run before optional network dependencies are installed.
+    browser_requests = None
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string
 
 
 SITE_URL = "https://topstokee.com"
 ROOT_SITEMAP = f"{SITE_URL}/sitemap.xml"
-SCRAPER_VERSION = "1.5"
+SCRAPER_VERSION = "1.6"
 TEMPLATE_SHEET = "Template"
 FIRST_DATA_ROW = 5
 REQUEST_MIN_INTERVAL_SECONDS = 0.22
@@ -103,26 +106,34 @@ MATERIAL_NAMES = {
 }
 
 SUPPORTED_CATEGORY_IDS = {
-    "tshirt_adult": "30469",
-    "tshirt_kids": "30843",
-    "hoodie_adult": "30467",
-    "hoodie_kids": "30847",
-    "sweatshirt_adult": "30466",
-    "sweatshirt_kids": "30847",
-    "tank_adult": "30475",
-    "tank_kids": "30841",
-    "vest_adult": "30407",
-    "vest_kids": "30763",
-    "windbreaker_adult": "30406",
-    "windbreaker_kids": "30763",
-    "shorts_adult": "30425",
-    "shorts_kids": "30728",
-    "short_set_adult": "27209",
-    "long_set_adult": "30443",
-    "set_kids": "30811",
-    "hat": "30611",
-    "polo_adult": "30472",
-    "polo_kids": "34988",
+    "tshirt_men": "30469",
+    "tshirt_women": "29069",
+    "tshirt_boys": "30843",
+    "tshirt_girls": "29553",
+    "hoodie_men": "30467",
+    "hoodie_women": "29065",
+    "hoodie_boys": "30846",
+    "hoodie_girls": "29690",
+    "sweatshirt_men": "30466",
+    "sweatshirt_women": "29066",
+    "sweatshirt_boys": "30847",
+    "tank_men": "30475",
+    "tank_women": "29075",
+    "tank_boys": "30841",
+    "tank_girls": "29555",
+    "vest_men": "30407",
+    "vest_women": "28971",
+    "windbreaker_men": "30406",
+    "windbreaker_women": "28963",
+    "shorts_men": "30425",
+    "shorts_women": "39129",
+    "shorts_boys": "30728",
+    "short_set_men": "27209",
+    "long_set_men": "30443",
+    "set_boys": "30811",
+    "hat_men": "30611",
+    "hat_women": "29270",
+    "polo_men": "30472",
 }
 
 DEFAULT_PACKAGE = {
@@ -337,6 +348,8 @@ class OutputRow:
 
 
 def browser_session() -> Any:
+    if browser_requests is None:
+        raise RuntimeError("curl_cffi is not installed; run: python -m pip install -r requirements.txt")
     session = getattr(_HTTP_STATE, "session", None)
     if session is None:
         session = browser_requests.Session(impersonate="chrome")
@@ -848,6 +861,8 @@ COLOR_KEY_MARKERS = ("цвят", "цвет", "color", "colour")
 COUPLE_MARKERS = ("двойк", "couple", "pair")
 MEN_KEY_MARKERS = ("мъж", "men", "male", "него", "момче", "boy")
 WOMEN_KEY_MARKERS = ("дам", "жен", "women", "woman", "female", "нея", "момич", "girl")
+MEN_AUDIENCE_MARKERS = ("мъж", "момче", "момчен")
+WOMEN_AUDIENCE_MARKERS = ("дам", "жен", "момич")
 
 
 def normalized_parameter_key(value: str) -> str:
@@ -901,6 +916,49 @@ def clean_parameter_label(key: str, fallback: str) -> str:
 def is_couple_product(name: str, category_path: str = "") -> bool:
     lowered = normalized_parameter_key(f"{name} {category_path}")
     return any(marker in lowered for marker in COUPLE_MARKERS)
+
+
+def infer_audience(
+    product: Product,
+    parameters: dict[str, str],
+    group_label: str,
+    is_kids: bool,
+) -> str:
+    """Infer only an explicitly published gender; otherwise use the template default."""
+    if is_couple_product(product.name, product.category_path):
+        return "mixed"
+
+    parameter_genders = {
+        parameter_gender(key)
+        for key in parameters
+        if parameter_gender(key)
+    }
+    if len(parameter_genders) > 1:
+        return "mixed"
+
+    text = normalized_parameter_key(
+        " ".join(
+            (
+                product.name,
+                product.category_path,
+                group_label,
+                *(f"{key} {value}" for key, value in parameters.items()),
+            )
+        )
+    )
+    has_women_marker = any(marker in text for marker in WOMEN_AUDIENCE_MARKERS) or bool(
+        re.search(r"\b(?:women|woman|female|girl)\b", text)
+    )
+    has_men_marker = any(marker in text for marker in MEN_AUDIENCE_MARKERS) or bool(
+        re.search(r"\b(?:men|man|male|boy)\b", text)
+    )
+    if has_women_marker and has_men_marker:
+        return "mixed"
+    if has_women_marker or parameter_genders == {"women"}:
+        return "girls" if is_kids else "women"
+    if has_men_marker or parameter_genders == {"men"}:
+        return "boys" if is_kids else "men"
+    return "boys" if is_kids else "men"
 
 
 def build_parameter_profile(variants: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1085,13 +1143,21 @@ def classify_kind(product: Product) -> str | None:
     return None
 
 
-def category_for(kind: str, is_kids: bool) -> tuple[str, str] | None:
-    if kind == "hat":
-        key = "hat"
-    elif kind in {"short_set", "long_set"}:
-        key = "set_kids" if is_kids else f"{kind}_adult"
+def category_for(kind: str, is_kids: bool, audience: str) -> tuple[str, str] | None:
+    # The supplied template has no unisex categories. Generic/mixed adult items
+    # use the men's category and generic child items use the boys' category.
+    # Explicit female items never fall back to a male category.
+    if audience == "mixed":
+        audience = "boys" if is_kids else "men"
+    if is_kids and audience not in {"boys", "girls"}:
+        audience = "boys"
+    if not is_kids and audience not in {"men", "women"}:
+        audience = "men"
+
+    if kind in {"short_set", "long_set"}:
+        key = f"set_{audience}" if is_kids else f"{kind}_{audience}"
     else:
-        key = f"{kind}_{'kids' if is_kids else 'adult'}"
+        key = f"{kind}_{audience}"
     category_id = SUPPORTED_CATEGORY_IDS.get(key)
     return (category_id, key) if category_id else None
 
@@ -1171,6 +1237,7 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
 
     mixed_age_groups = len({item["is_kids"] for item in analyzed_variants}) > 1
     rows: list[OutputRow] = []
+    unmapped_categories: set[str] = set()
     for analyzed in analyzed_variants:
         variant = analyzed["variant"]
         params = analyzed["params"]
@@ -1182,8 +1249,10 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
         color = analyzed["color"]
         group_signature = analyzed["group_signature"]
         group_label = analyzed["group_label"]
-        category = category_for(kind, is_kids)
+        audience = infer_audience(product, params, group_label, is_kids)
+        category = category_for(kind, is_kids, audience)
         if not category:
+            unmapped_categories.add(f"{audience}/{kind}")
             continue
         category_id, category_key = category
         variant_id = str(variant.get("id") or "single")
@@ -1232,6 +1301,11 @@ def product_to_rows(product: Product, config: Config) -> tuple[list[OutputRow], 
                 variant_parameters=dict(params),
             )
         )
+    if unmapped_categories:
+        missing = ", ".join(sorted(unmapped_categories))
+        if rows:
+            return rows, f"Some variants skipped: no exact Temu category for {missing}"
+        return [], f"No exact Temu category in the supplied template for {missing}"
     return rows, None if rows else "No sellable variant could be mapped"
 
 
@@ -1370,7 +1444,7 @@ class TemuTemplate:
                 top_table = TOP_MEASUREMENTS_WINDBREAKER_ADULT
             elif item.product_kind == "vest":
                 top_table = TOP_MEASUREMENTS_VEST_ADULT
-            elif "дам" in source_text:
+            elif item.category_key.endswith("_women") or "дам" in source_text or "жен" in source_text:
                 top_table = TOP_MEASUREMENTS_TSHIRT_WOMEN
             else:
                 top_table = TOP_MEASUREMENTS_TSHIRT_ADULT

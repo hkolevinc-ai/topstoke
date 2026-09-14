@@ -85,6 +85,7 @@ class SizeTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertEqual(len(rows), 2)
         self.assertEqual(len({row.parent_sku for row in rows}), 2)
+        self.assertEqual({row.category_id for row in rows}, {"30469", "29069"})
         self.assertTrue(any("Мъжки" in row.name for row in rows))
         self.assertTrue(any("Дамски" in row.name for row in rows))
 
@@ -128,7 +129,7 @@ class SizeTests(unittest.TestCase):
     def test_age_range_measurements_use_height_equivalents(self):
         base = dict(
             source_url="u", source_category="ЗА ДЕЦА", category_id="30847",
-            category_key="sweatshirt_kids", product_id="1", parent_sku="p", sku="s",
+            category_key="sweatshirt_boys", product_id="1", parent_sku="p", sku="s",
             name="n", description="d", bullets=[], main_images=[], detail_images=[],
             size_raw="12/13г.", size_family="101 - Custom size", sub_size_family="10 - Alpha",
             temu_size="12-13Y", color="Multicolor", price=1.0, list_price=2.0, quantity=10,
@@ -157,6 +158,83 @@ class CategoryTests(unittest.TestCase):
         )
         self.assertIsNone(classify_kind(item))
 
+    def test_womens_tshirt_uses_womens_category(self):
+        rows, reason = product_to_rows(
+            product(
+                "Дамска тениска България",
+                "ТЕНИСКИ",
+                "https://topstokee.com/product/damska-teniska",
+                [{"id": "1", "parameters": {"Дамски размер": "M"}, "price": 20.0, "list_price": 25.0}],
+            ),
+            Config(),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(rows[0].category_id, "29069")
+        self.assertEqual(rows[0].category_key, "tshirt_women")
+
+    def test_girls_hoodie_uses_girls_hoodie_category(self):
+        item = product(
+            "Детски суичър за момиче",
+            "ЗА ДЕЦА > СУИЧЪРИ",
+            "https://topstokee.com/product/momiche-hoodie",
+            [{"id": "1", "parameters": {"Размер": "128"}, "price": 20.0, "list_price": 25.0}],
+        )
+        item.description = "Памучен суичър с качулка"
+        rows, reason = product_to_rows(item, Config())
+        self.assertIsNone(reason)
+        self.assertEqual(rows[0].category_id, "29690")
+        self.assertEqual(rows[0].category_key, "hoodie_girls")
+
+    def test_boys_hoodie_uses_hoodie_not_sweatshirt_category(self):
+        item = product(
+            "Детски суичър за момче",
+            "ЗА ДЕЦА > СУИЧЪРИ",
+            "https://topstokee.com/product/momche-hoodie",
+            [{"id": "1", "parameters": {"Размер": "128"}, "price": 20.0, "list_price": 25.0}],
+        )
+        item.description = "Памучен суичър с качулка"
+        rows, reason = product_to_rows(item, Config())
+        self.assertIsNone(reason)
+        self.assertEqual(rows[0].category_id, "30846")
+        self.assertEqual(rows[0].category_key, "hoodie_boys")
+
+    def test_explicit_girls_sweatshirt_is_skipped_without_exact_category(self):
+        rows, reason = product_to_rows(
+            product(
+                "Суичър За Момиченце Mini Dragon 2",
+                "ЗА ДЕЦА > СУИЧЪРИ",
+                "https://topstokee.com/product/suichar-za-momichence-mini-dragon-2",
+                [{"id": "1", "parameters": {"Размер": "128"}, "price": 20.0, "list_price": 25.0}],
+            ),
+            Config(),
+        )
+        self.assertEqual(rows, [])
+        self.assertIn("girls/sweatshirt", reason)
+
+    def test_child_hat_is_skipped_without_child_hat_category(self):
+        rows, reason = product_to_rows(
+            product(
+                "Детска Шапка Ballerina Cappuccina",
+                "ЗА ДЕЦА > ШАПКИ И РАНИЦИ",
+                "https://topstokee.com/product/detska-shapka-ballerina-cappuccina",
+            ),
+            Config(),
+        )
+        self.assertEqual(rows, [])
+        self.assertIn("boys/hat", reason)
+
+    def test_womens_hat_uses_womens_category(self):
+        rows, reason = product_to_rows(
+            product(
+                "Дамска шапка с козирка",
+                "ШАПКИ",
+                "https://topstokee.com/product/damska-shapka",
+            ),
+            Config(),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(rows[0].category_id, "29270")
+
 
 class ExportSafetyTests(unittest.TestCase):
     @staticmethod
@@ -165,7 +243,7 @@ class ExportSafetyTests(unittest.TestCase):
             source_url="https://topstokee.com/product/test",
             source_category="ТЕНИСКИ",
             category_id="30469",
-            category_key="tshirt_adult",
+            category_key="tshirt_men",
             product_id="1",
             parent_sku=parent,
             sku=sku,

@@ -1,6 +1,6 @@
 # TopStokee → Temu scraper
 
-Version 1.5 routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
+Version 1.6 is the final release. It routes TopStokee requests through a protected Cloudflare Worker, because TopStokee blocks GitHub-hosted runner addresses with HTTP 403. The Worker is restricted to `topstokee.com` and requires a secret token. Browser TLS/HTTP2 impersonation and the CloudCart AJAX fallback remain available.
 
 The scraper scans all products on `topstokee.com`, reads the CloudCart product data, and populates the supplied Temu template. Product discovery automatically falls back from the sitemap index to direct product sitemaps and then to the complete product catalogue when a GitHub runner receives HTTP 403.
 
@@ -11,6 +11,9 @@ The scraper scans all products on `topstokee.com`, reads the CloudCart product d
 - combines the separate men's and women's sizes for couple products into labels such as `Men S / Women M`;
 - recognizes flexible parameter labels such as sizes for him/her, alternative color labels, gender and model selectors;
 - separates gender/model groups into distinct Temu parent products when the source site reuses the same sizes;
+- assigns exact men's, women's, boys' and girls' Temu categories when the product explicitly publishes a gender;
+- uses the correct boys' hoodie category instead of the boys' sweatshirt category;
+- skips explicitly gendered products when the supplied template has no exact matching category, rather than forcing them into the opposite gender;
 - normalizes Cyrillic `М`, children's age ranges, and fixed outlet sizes found in product names;
 - distinguishes children's hats from backpacks in the combined site category;
 - splits mixed adult and children's sizes into separate Temu parent products;
@@ -44,7 +47,7 @@ The Worker URL is already set in `config.json` as `https://topstokee-proxy.hkole
 1. Upload every file and folder from this package to the GitHub repository. Keep `.github/workflows/scraper.yml` in the same path.
 2. Open **Actions → TopStokee Temu scraper → Run workflow**.
 3. First choose `test`, leave `max_products` at `0`, set `workers` to `3`, and run it. Test mode scans 15 products and prioritizes several couple-size formats, repeated adult sizes, the children's hat, age ranges, and Cyrillic sizes.
-4. Download the `topstokee-temu-results` artifact and confirm that `summary.json` contains `"validation_passed": true`, `"duplicate_variant_combinations": 0`, and `"parent_products_split_across_files": 0`.
+4. Download the `topstokee-temu-results` artifact and confirm that `summary.json` contains `"scraper_version": "1.6"`, `"validation_passed": true`, `"duplicate_variant_combinations": 0`, and `"parent_products_split_across_files": 0`. The test intentionally includes products that may be listed in `topstokee_skipped_products.csv` when the template has no exact gender/category match.
 5. After the test succeeds, run again with `mode = full` and `max_products = 0`.
 
 A full run currently discovers about 2,300 product pages and normally takes roughly 20–40 minutes through the Worker, depending on the site's response time. GitHub Actions keeps the generated files as a downloadable artifact.
@@ -58,7 +61,9 @@ A full run currently discovers about 2,300 product pages and normally takes roug
 - color is `Multicolor` when CloudCart does not publish a color variation;
 - package weight/dimensions and fallback fabric composition use product-type defaults in `scraper.py`.
 
-Products for which the supplied Temu template has no suitable category, such as standalone sweatpants or backpacks, are not forced into an incorrect category. They are listed in `topstokee_skipped_products.csv`.
+Products for which the supplied Temu template has no suitable category, such as standalone sweatpants, backpacks, children's hats, or explicitly girls' sweatshirts without a matching girls' sweatshirt category, are not forced into an incorrect category. They are listed in `topstokee_skipped_products.csv`.
+
+The supplied template has no unisex category. Products with no published gender and couple products therefore use the existing men's category for adults and boys' category for children. Explicitly female products never fall back to a male category.
 
 If the source site introduces a variation pattern that cannot be represented uniquely in Temu, validation stops the run before any XLSX file is created. The raw CSV retains `variant_group` and `variant_parameters` columns for diagnosis.
 
